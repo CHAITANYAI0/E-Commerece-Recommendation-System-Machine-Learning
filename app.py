@@ -13,7 +13,7 @@ train_data = pd.read_csv("models/clean_data.csv")
 
 # database configuration---------------------------------------
 app.secret_key = "alskdjfwoeieiurlskdjfslkdjf"
-app.config['SQLALCHEMY_DATABASE_URI'] = "mysql://root:@localhost/ecom"
+app.config['SQLALCHEMY_DATABASE_URI'] = "mysql+pymysql://root:@127.0.0.1:3307/ecomm"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
@@ -41,19 +41,17 @@ def truncate(text, length):
         return text
 
 
-def content_based_recommendations(train_data, item_name, top_n=10):
+def content_based_recommendations_with_threshold(train_data, item_name, top_n=10, min_reviews=50):
     # Check if the item name exists in the training data
     if item_name not in train_data['Name'].values:
         print(f"Item '{item_name}' not found in the training data.")
         return pd.DataFrame()
 
-    # Create a TF-IDF vectorizer for item descriptions
+    # Create a TF-IDF vectorizer for item tags
     tfidf_vectorizer = TfidfVectorizer(stop_words='english')
-
-    # Apply TF-IDF vectorization to item descriptions
     tfidf_matrix_content = tfidf_vectorizer.fit_transform(train_data['Tags'])
 
-    # Calculate cosine similarity between items based on descriptions
+    # Calculate cosine similarity between items based on tags
     cosine_similarities_content = cosine_similarity(tfidf_matrix_content, tfidf_matrix_content)
 
     # Find the index of the item
@@ -65,16 +63,36 @@ def content_based_recommendations(train_data, item_name, top_n=10):
     # Sort similar items by similarity score in descending order
     similar_items = sorted(similar_items, key=lambda x: x[1], reverse=True)
 
-    # Get the top N most similar items (excluding the item itself)
-    top_similar_items = similar_items[1:top_n+1]
-
     # Get the indices of the top similar items
-    recommended_item_indices = [x[0] for x in top_similar_items]
+    top_similar_items = similar_items[1:top_n + 10]  # Select more items initially for filtering
 
-    # Get the details of the top similar items
-    recommended_items_details = train_data.iloc[recommended_item_indices][['Name', 'ReviewCount', 'Brand', 'ImageURL', 'Rating']]
+    # Retrieve the corresponding items
+    recommended_items_details = train_data.iloc[[x[0] for x in top_similar_items]].copy()
 
-    return recommended_items_details
+    # Compute the weighted rating for each item
+    C = train_data['Rating'].mean()  # Mean rating across all products
+    m = train_data['ReviewCount'].quantile(0.75)  # Minimum reviews to be considered (75th percentile)
+
+    def weighted_rating(row):
+        v = row['ReviewCount']
+        R = row['Rating']
+        return ((v * R) + (m * C)) / (v + m) if v > 0 else C
+
+    # Add weighted rating to the recommended items
+    recommended_items_details['WeightedRating'] = recommended_items_details.apply(weighted_rating, axis=1)
+
+    # Apply review count threshold
+    recommended_items_details = recommended_items_details[recommended_items_details['ReviewCount'] >= min_reviews]
+
+    # Sort recommendations by WeightedRating
+    recommended_items_details = recommended_items_details.sort_values(by='WeightedRating', ascending=False)
+
+    recommended_items_details = recommended_items_details[['Name', 'ReviewCount', 'Brand', 'ImageURL', 'Rating']]
+
+
+    # Return the top N recommendations
+    return recommended_items_details.head(top_n)
+
 # routes===============================================================================
 # List of predefined image URLs
 random_image_urls = [
@@ -153,21 +171,26 @@ def recommendations():
     if request.method == 'POST':
         prod = request.form.get('prod')
         nbr = int(request.form.get('nbr'))
-        content_based_rec = content_based_recommendations(train_data, prod, top_n=nbr)
+
+        # Call the recommendation function
+        content_based_rec = content_based_recommendations_with_threshold(
+            train_data, prod, top_n=nbr, min_reviews=50
+        )
 
         if content_based_rec.empty:
             message = "No recommendations available for this product."
             return render_template('main.html', message=message)
         else:
-            # Create a list of random image URLs for each recommended product
-            random_product_image_urls = [random.choice(random_image_urls) for _ in range(len(trending_products))]
-            print(content_based_rec)
-            print(random_product_image_urls)
+            # Convert DataFrame to list of dictionaries
+            recommendations_list = content_based_rec.to_dict(orient='records')
 
-            price = [40, 50, 60, 70, 100, 122, 106, 50, 30, 50]
-            return render_template('main.html', content_based_rec=content_based_rec, truncate=truncate,
-                                   random_product_image_urls=random_product_image_urls,
-                                   random_price=random.choice(price))
+            # Pass the recommendations to the template
+            return render_template(
+                'main.html',
+                content_based_rec=recommendations_list,
+                truncate=truncate,
+                random_price=random.choice([40, 50, 60, 70, 100, 122, 106, 50, 30, 50])
+            )
 
 
 if __name__=='__main__':
